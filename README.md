@@ -1,6 +1,6 @@
-# FStoreX — Distributed File Storage with Raft-based High Availability
+# FStoreX — Fast distributed storage for AI workloads
 
-A distributed file storage system providing a Unix-like hierarchical directory tree interface. The system consists of three independent binaries communicating via Go's standard `net/rpc` package, depending only on [goraft](https://github.com/lwwgo/goraft) (which itself has zero external dependencies). The metadata server uses the goraft consensus protocol to form a 3-node highly available cluster.
+FStoreX is a high-performance distributed file and object storage system designed for AI workloads. Built for **speed, efficiency, and simplicity**, it provides a Unix-like hierarchical directory tree interface with POSIX-like file semantics. The system consists of three independent binaries communicating via Go's standard `net/rpc` package, depending only on [goraft](https://github.com/lwwgo/goraft) (which itself has zero external dependencies). The metadata server uses the goraft consensus protocol to form a 3-node highly available cluster.
 
 ## Architecture
 
@@ -27,7 +27,7 @@ A distributed file storage system providing a Unix-like hierarchical directory t
 |---|---|---|---|
 | **Metadata Server** | `fstorex-metadata` | 9001/9002/9003 | Manages the global directory tree, file→DataNode mapping, multi-replica allocation, and DataNode heartbeat lifecycle; guarantees multi-node consistency via Raft |
 | **Data Node** | `fstorex-datanode` | 9101+ | Stores actual file content to local disk; sends periodic heartbeats to MDS (first heartbeat = auto-registration, auto-redirects to leader); reports held paths for orphan GC |
-| **Client** | `client` | — | CLI tool; metadata operations go through MDS, data operations go MDS→DataNode; writes auto-redirect from follower to leader |
+| **Client** | `fstorex` | — | Unified CLI tool: file operations (mkdir/put/get/ls/stat/rm), cluster management (nodes/gc), and FUSE filesystem mount; metadata operations go through MDS, data operations go MDS→DataNode; writes auto-redirect from follower to leader |
 
 ### Data Flow
 
@@ -204,6 +204,37 @@ Three layers of defense against "metadata exists but no data" inconsistencies:
 2. **Empty file legality**: Pending files return empty content on read instead of erroring
 3. **Background GC**: Orphan data on DataNodes is eventually cleaned up by the GC cycle
 
+### FUSE Mount
+
+FStoreX can be mounted as a local filesystem via [FUSE](https://en.wikipedia.org/wiki/Filesystem_in_Userspace), letting users interact with distributed storage using standard shell commands instead of a custom CLI. Built on [hanwen/go-fuse](https://github.com/hanwen/go-fuse) v2's node-based API, it follows POSIX inode/fd separation:
+
+- **inode layer** (`fuseNode`): persistent, handles metadata (Getattr), directory lookup (Lookup/Readdir), naming operations (Create/Mkdir/Unlink/Rename), and the Open entry point
+- **fd layer** (`fuseFileHandle`): temporary session per Open, handles Read/Write/Fsync/Release of the underlying `client.FileHandle`
+
+Features:
+- Standard POSIX file operations work transparently: `echo > file`, `cat`, `mkdir`, `ls`, `mv`, `rm`
+- Kernel-level attribute/dentry caching (1s TTL) reduces MDS RPC pressure
+- Graceful unmount on SIGINT/SIGTERM
+
+Usage:
+
+```bash
+mkdir -p /mnt/fstorex
+./bin/fstorex -mds=localhost:9001 mount /mnt/fstorex
+
+# Now use it like a local filesystem
+echo hello > /mnt/fstorex/a.txt
+cat /mnt/fstorex/a.txt
+mkdir /mnt/fstorex/data
+ls /mnt/fstorex
+
+# Unmount
+# Linux:  umount /mnt/fstorex
+# macOS:  diskutil unmount /mnt/fstorex
+```
+
+**Platform note**: macOS requires [macFUSE](https://macfuse.io/) (`brew install --cask macfuse`, restart required). Linux uses the kernel FUSE module (usually pre-installed; install `fuse` package if needed).
+
 ## Quick Start
 
 ### One-Click Demo
@@ -287,6 +318,9 @@ go build -o bin/fstorex ./cmd/fstorex
 
 # Manually trigger orphan data garbage collection
 ./bin/fstorex -mds=localhost:9001 gc
+
+# Mount FStoreX as local filesystem (FUSE)
+./bin/fstorex -mds=localhost:9001 mount /mnt/fstorex
 ```
 
 ## Project Structure
@@ -304,12 +338,18 @@ fstorex/
 │   │   ├── state_machine.go       # goraft StateMachine interface (Apply/Snapshot/Restore)
 │   │   ├── apply.go               # Apply internal implementations (mkdir/create/complete/delete/heartbeat/remove_dn)
 │   │   └── gc.go                  # Background orphan data garbage collection
-│   ├── datanode/datanode.go       # DataNode core: content storage + RPC
-│   └── client/client.go           # Client logic: RPC wrapper + follower redirect
+│   ├── datanode/datanode.go       # DataNode core: content storage + random I/O RPC
+│   ├── client/
+│   │   ├── client.go              # Client logic: RPC wrapper + follower redirect
+│   │   └── file_handle.go         # FileHandle: Open/ReadAt/WriteAt/Truncate/Sync
+│   └── fuse/
+│       ├── node.go                # FUSE inode layer (fuseNode): Getattr/Lookup/Readdir/Open/Create/Mkdir/Unlink/Rename
+│       ├── file_handle.go         # FUSE fd layer (fuseFileHandle): Read/Write/Fsync/Release
+│       └── filesystem.go           # FUSE Mount entry point
 ├── .golangci.yml                  # golangci-lint configuration
 ├── .gitignore                     # Ignores build artifacts and runtime data
 ├── Makefile                       # build/test/lint/clean targets
-├── go.mod                         # require github.com/lwwgo/goraft v1.0.1
+├── go.mod                         # require goraft v1.0.3 + go-fuse/v2 v2.11.0
 ├── go.sum                         # Dependency checksums
 ├── start.sh                       # One-click demo script (3 MDS + 2 DataNode)
 ├── LICENSE                        # MIT License
@@ -346,9 +386,11 @@ The project depends on [goraft](https://github.com/lwwgo/goraft), a standalone R
 
 10. **Ghost file protection**: Three-layer defense — client compensation deletion, empty file legality for pending state, and background orphan GC.
 
-11. **Zero third-party dependencies**: Built entirely with the Go standard library (`net/rpc`, `encoding/json`, `log/slog`), depending only on goraft (which itself has zero external dependencies). Compile and run.
+11. **Minimal dependencies**: Core system built with the Go standard library (`net/rpc`, `encoding/json`, `log/slog`) plus goraft (zero external deps). FUSE mount layer adds [hanwen/go-fuse/v2](https://github.com/hanwen/go-fuse) as the only additional dependency, isolated in `internal/fuse/` so server binaries stay lean.
 
 12. **WAL + Snapshot persistence**: Each MDS node persists Raft state via WAL + Snapshot. After restart, the state machine is restored from the Snapshot and incremental WAL logs are replayed.
+
+13. **FUSE filesystem mount**: Transparently mount FStoreX as a local filesystem using standard shell commands. The FUSE layer follows POSIX inode/fd separation (`fuseNode` vs `fuseFileHandle`), with kernel-level attribute caching to minimize MDS RPC pressure. Unified into the `fstorex` CLI as a `mount` subcommand — no separate binary needed.
 
 ## Testing
 
