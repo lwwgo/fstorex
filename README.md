@@ -392,6 +392,15 @@ The project depends on [goraft](https://github.com/lwwgo/goraft), a standalone R
 
 13. **FUSE filesystem mount**: Transparently mount FStoreX as a local filesystem using standard shell commands. The FUSE layer follows POSIX inode/fd separation (`fuseNode` vs `fuseFileHandle`), with kernel-level attribute caching to minimize MDS RPC pressure. Unified into the `fstorex` CLI as a `mount` subcommand — no separate binary needed.
 
+## Limitations
+
+FStoreX is designed for AI workloads where files are typically written completely before being read. The following limitations are intentional trade-offs for simplicity and performance, not bugs:
+
+- **No concurrent read-write consistency**: Concurrent writes, or concurrent reads during writes, are not guaranteed to return consistent snapshots. A `ReadAt` issued while a `WriteAt` is in progress may return a mix of old and new data across different regions of the file. Users must serialize read/write access (e.g., write the whole file first, then read).
+- **No cross-fd locking**: Different FileHandles or processes accessing the same file concurrently have no mutual exclusion. Application-level locking is required if concurrent modification is needed.
+- **Partial write failure leaves replica divergence**: If a `WriteAt` partially fails (some replicas succeed, others fail), the failed replicas are not rolled back. Subsequent reads may see divergent content until the next full-success write overwrites all replicas. The system logs warnings but does not auto-heal this case.
+- **No Lease-based consistency**: Phase 1.5 does not implement lease or version-based read validation. This may be added in a future phase for stricter consistency guarantees.
+
 ## Testing
 
 ```bash
