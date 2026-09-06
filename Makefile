@@ -4,7 +4,7 @@
 .PHONY: all build test lint fmt tidy clean
 
 BINARY_DIR := bin
-BINARIES := fstorex fstorex-metadata fstorex-datanode
+BINARIES := fstorex fstorex-mds fstorex-dn
 
 all: lint test build
 

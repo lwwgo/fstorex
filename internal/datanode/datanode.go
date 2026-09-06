@@ -27,11 +27,14 @@ const heartbeatInterval = 5 * time.Minute
 
 // DataNode 是数据节点的核心实现。
 type DataNode struct {
-	dataDir string       // 本地数据存储根目录
-	mdsAddr string       // MDS 的 RPC 地址
-	addr    string       // 本节点的 RPC 地址
-	mu      sync.RWMutex // 保护并发写入
-	logger  *slog.Logger
+	dataDir           string       // 本地数据存储根目录
+	mdsAddr           string       // MDS 的 RPC 地址
+	addr              string       // 本节点的 RPC 地址
+	mu                sync.RWMutex // 保护并发写入
+	logger            *slog.Logger
+	HeartbeatInterval time.Duration // 心跳间隔（默认 5min，测试可缩短）
+	stopCh            chan struct{} // 停止 heartbeat goroutine
+	stopOnce          sync.Once     // 保证 Stop 只执行一次
 }
 
 // NewDataNode 创建数据节点实例。
@@ -40,10 +43,12 @@ func NewDataNode(dataDir, mdsAddr, addr string, logger *slog.Logger) (*DataNode,
 		return nil, fmt.Errorf("failed to create data dir: %w", err)
 	}
 	dn := &DataNode{
-		dataDir: dataDir,
-		mdsAddr: mdsAddr,
-		addr:    addr,
-		logger:  logger,
+		dataDir:           dataDir,
+		mdsAddr:           mdsAddr,
+		addr:              addr,
+		logger:            logger,
+		HeartbeatInterval: heartbeatInterval,
+		stopCh:            make(chan struct{}),
 	}
 	logger.Info("data node initialized", "data_dir", dataDir, "mds_addr", mdsAddr, "addr", addr)
 	return dn, nil
@@ -61,13 +66,27 @@ func (dn *DataNode) StartHeartbeat() {
 	// 立即发第一次心跳（即注册）
 	dn.sendHeartbeat()
 	go func() {
-		ticker := time.NewTicker(heartbeatInterval)
+		ticker := time.NewTicker(dn.HeartbeatInterval)
 		defer ticker.Stop()
-		for range ticker.C {
-			dn.sendHeartbeat()
+		for {
+			select {
+			case <-ticker.C:
+				dn.sendHeartbeat()
+			case <-dn.stopCh:
+				return
+			}
 		}
 	}()
-	dn.logger.Info("heartbeat goroutine started", "interval", heartbeatInterval)
+	dn.logger.Info("heartbeat goroutine started", "interval", dn.HeartbeatInterval)
+}
+
+// Stop 停止 heartbeat goroutine，模拟节点故障。
+// 使用 sync.Once 保证可安全多次调用。
+func (dn *DataNode) Stop() {
+	dn.stopOnce.Do(func() {
+		close(dn.stopCh)
+		dn.logger.Info("data node stopped")
+	})
 }
 
 // sendHeartbeat sends one heartbeat with leader redirect support.
@@ -307,7 +326,19 @@ func (dn *DataNode) Truncate(args *types.TruncateArgs, reply *bool) error {
 		return err
 	}
 
-	// 文件不存在时，truncate 到非 0 大小会创建 sparse 文件；truncate 到 0 则无操作（幂等）
+	// 文件不存在时，truncate 到非 0 大小会创建 sparse 文件（符合 POSIX truncate 语义）；
+	// truncate 到 0 则无操作（幂等）
+	if args.Size > 0 {
+		// 确保父目录存在
+		if err := os.MkdirAll(filepath.Dir(realPath), 0755); err != nil {
+			return fmt.Errorf("ensure parent dir failed: %w", err)
+		}
+		f, err := os.OpenFile(realPath, os.O_CREATE|os.O_RDWR, 0644)
+		if err != nil {
+			return fmt.Errorf("create file for truncate failed: %w", err)
+		}
+		f.Close()
+	}
 	if err := os.Truncate(realPath, args.Size); err != nil {
 		return fmt.Errorf("failed to truncate data: %w", err)
 	}
@@ -342,6 +373,87 @@ func (dn *DataNode) Sync(args *types.SyncArgs, reply *bool) error {
 
 	*reply = true
 	dn.logger.Debug("data synced", "path", args.Path)
+	return nil
+}
+
+// replicateChunkSize 是 ReplicateFile 分块拉取的大小（1MB）。
+// 避免大文件一次性读入内存导致 OOM。
+const replicateChunkSize = 1 << 20
+
+// ReplicateFile 从源 DataNode 分块拉取文件副本到本地。
+// 由 MDS 编排调用，数据搬运不经过 MDS，避免成为带宽瓶颈。
+// 目标 DN 主动 dial 源 DN → 分块 RangeRead → 本地 WriteAt → fsync。
+func (dn *DataNode) ReplicateFile(args *types.ReplicateFileArgs, reply *bool) error {
+	// 1. dial 源 DataNode
+	srcClient, err := rpc.Dial("tcp", args.SourceAddr)
+	if err != nil {
+		return fmt.Errorf("cannot connect to source data node at %s: %w", args.SourceAddr, err)
+	}
+	defer srcClient.Close()
+
+	// 2. 解析本地目标路径，确保父目录存在
+	realPath, err := dn.resolvePath(args.TargetRemotePath)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(realPath), 0755); err != nil {
+		return fmt.Errorf("ensure parent dir failed: %w", err)
+	}
+
+	// 3. 打开本地目标文件（O_CREATE|O_RDWR，幂等覆盖）
+	dn.mu.Lock()
+	f, err := os.OpenFile(realPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0644)
+	if err != nil {
+		dn.mu.Unlock()
+		return fmt.Errorf("failed to open target file for replicate: %w", err)
+	}
+	dn.mu.Unlock()
+	defer f.Close()
+
+	// 4. 分块从源 DN 拉取并写入
+	offset := int64(0)
+	totalWritten := int64(0)
+	for offset < args.FileSize {
+		chunkLen := int64(replicateChunkSize)
+		if offset+chunkLen > args.FileSize {
+			chunkLen = args.FileSize - offset
+		}
+
+		// 从源 DN RangeRead
+		rangeArgs := &types.RangeReadArgs{
+			Path:   args.SourceRemotePath,
+			Offset: offset,
+			Length: chunkLen,
+		}
+		var rangeReply types.RangeReadReply
+		if err := srcClient.Call("DataService.RangeRead", rangeArgs, &rangeReply); err != nil {
+			return fmt.Errorf("range read from source at offset %d: %w", offset, err)
+		}
+
+		// 写入本地（WriteAt 天然支持 offset 写入）
+		n, err := f.WriteAt(rangeReply.Data, offset)
+		if err != nil {
+			return fmt.Errorf("write local at offset %d: %w", offset, err)
+		}
+		if n != len(rangeReply.Data) {
+			return fmt.Errorf("short write at offset %d: %d != %d", offset, n, len(rangeReply.Data))
+		}
+
+		offset += int64(n)
+		totalWritten += int64(n)
+	}
+
+	// 5. fsync 确保持久化
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("fsync target file after replicate: %w", err)
+	}
+
+	*reply = true
+	dn.logger.Info("file replicated",
+		"source", args.SourceAddr,
+		"source_path", args.SourceRemotePath,
+		"target_path", args.TargetRemotePath,
+		"size", totalWritten)
 	return nil
 }
 

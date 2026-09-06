@@ -25,8 +25,8 @@ FStoreX is a high-performance distributed file and object storage system designe
 
 | Component | Binary | Default Port(s) | Responsibility |
 |---|---|---|---|
-| **Metadata Server** | `fstorex-metadata` | 9001/9002/9003 | Manages the global directory tree, file→DataNode mapping, multi-replica allocation, and DataNode heartbeat lifecycle; guarantees multi-node consistency via Raft |
-| **Data Node** | `fstorex-datanode` | 9101+ | Stores actual file content to local disk; sends periodic heartbeats to MDS (first heartbeat = auto-registration, auto-redirects to leader); reports held paths for orphan GC |
+| **Metadata Server** | `fstorex-mds` | 9001/9002/9003 | Manages the global directory tree, file→DataNode mapping, multi-replica allocation, and DataNode heartbeat lifecycle; guarantees multi-node consistency via Raft |
+| **Data Node** | `fstorex-dn` | 9101+ | Stores actual file content to local disk; sends periodic heartbeats to MDS (first heartbeat = auto-registration, auto-redirects to leader); reports held paths for orphan GC |
 | **Client** | `fstorex` | — | Unified CLI tool: file operations (mkdir/put/get/ls/stat/rm), cluster management (nodes/gc), and FUSE filesystem mount; metadata operations go through MDS, data operations go MDS→DataNode; writes auto-redirect from follower to leader |
 
 ### Data Flow
@@ -265,8 +265,8 @@ make all      # lint + test + build
 ```bash
 cd fstorex
 mkdir -p bin
-go build -o bin/fstorex-metadata ./cmd/fstorex-metadata
-go build -o bin/fstorex-datanode ./cmd/fstorex-datanode
+go build -o bin/fstorex-mds ./cmd/fstorex-mds
+go build -o bin/fstorex-dn ./cmd/fstorex-dn
 go build -o bin/fstorex ./cmd/fstorex
 ```
 
@@ -274,13 +274,13 @@ go build -o bin/fstorex ./cmd/fstorex
 
 ```bash
 # 1. Start 3 MDS nodes (Raft cluster)
-./bin/fstorex-metadata -id=localhost:9001 -peers=localhost:9002,localhost:9003 -waldir=/tmp/mds1/wal -snapdir=/tmp/mds1/snap
-./bin/fstorex-metadata -id=localhost:9002 -peers=localhost:9001,localhost:9003 -waldir=/tmp/mds2/wal -snapdir=/tmp/mds2/snap
-./bin/fstorex-metadata -id=localhost:9003 -peers=localhost:9001,localhost:9002 -waldir=/tmp/mds3/wal -snapdir=/tmp/mds3/snap
+./bin/fstorex-mds -id=localhost:9001 -peers=localhost:9002,localhost:9003 -waldir=/tmp/mds1/wal -snapdir=/tmp/mds1/snap
+./bin/fstorex-mds -id=localhost:9002 -peers=localhost:9001,localhost:9003 -waldir=/tmp/mds2/wal -snapdir=/tmp/mds2/snap
+./bin/fstorex-mds -id=localhost:9003 -peers=localhost:9001,localhost:9002 -waldir=/tmp/mds3/wal -snapdir=/tmp/mds3/snap
 
 # 2. Start data nodes (connect to any MDS; auto-redirects to leader)
-./bin/fstorex-datanode -addr=:9101 -mds=localhost:9001 -datadir=/tmp/dn1
-./bin/fstorex-datanode -addr=:9102 -mds=localhost:9001 -datadir=/tmp/dn2
+./bin/fstorex-dn -addr=:9101 -mds=localhost:9001 -datadir=/tmp/dn1
+./bin/fstorex-dn -addr=:9102 -mds=localhost:9001 -datadir=/tmp/dn2
 
 # 3. Use the client (connect to any MDS)
 ./bin/fstorex -mds=localhost:9001 nodes
@@ -328,8 +328,8 @@ go build -o bin/fstorex ./cmd/fstorex
 ```
 fstorex/
 ├── cmd/                           # Three independent entry points
-│   ├── fstorex-metadata/main.go    # Metadata server binary (Raft node)
-│   ├── fstorex-datanode/main.go    # Data node binary
+│   ├── fstorex-mds/main.go    # Metadata server binary (Raft node)
+│   ├── fstorex-dn/main.go    # Data node binary
 │   └── fstorex/main.go             # Client CLI binary
 ├── internal/
 │   ├── types/types.go             # Shared types + RPC interface definitions
