@@ -1,8 +1,8 @@
-// client is the client CLI binary for the distributed file system.
+// fstorex is the unified client CLI for FStoreX distributed file system.
 //
 // Usage:
 //
-//	./client -mds=localhost:9001 <command> [args]
+//	./fstorex -mds=localhost:9001 <command> [args]
 //
 // Commands:
 //
@@ -15,6 +15,7 @@
 //	replicas <path>                 Show file's replica locations
 //	nodes                           List registered data nodes
 //	gc                              Trigger orphan data garbage collection
+//	mount <mountpoint>              Mount FStoreX as local filesystem (FUSE)
 package main
 
 import (
@@ -22,10 +23,13 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/signal"
+	"syscall"
 	"text/tabwriter"
 	"time"
 
 	"github.com/lwwgo/fstorex/internal/client"
+	"github.com/lwwgo/fstorex/internal/fuse"
 	"github.com/lwwgo/fstorex/internal/types"
 )
 
@@ -178,6 +182,37 @@ func main() {
 		}
 		fmt.Println("✓ GC triggered in background (check MDS logs for results)")
 
+	case "mount":
+		if len(args) < 2 {
+			fmt.Println("Usage: fstorex -mds=<addr> mount <mountpoint>")
+			os.Exit(1)
+		}
+		mountPoint := args[1]
+		// 检查挂载点存在
+		if info, err := os.Stat(mountPoint); err != nil || !info.IsDir() {
+			fmt.Fprintf(os.Stderr, "Error: mount point %s does not exist or is not a directory\n", mountPoint)
+			os.Exit(1)
+		}
+		// 挂载（阻塞直到收到信号）
+		unmount, err := fuse.Mount(*mdsAddr, mountPoint, logger)
+		if err != nil {
+			logger.Error("mount failed", "error", err)
+			os.Exit(1)
+		}
+		logger.Info("FStoreX mounted", "mount_point", mountPoint, "mds", *mdsAddr)
+		logger.Info("Press Ctrl+C to unmount")
+		// 等待信号优雅卸载
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+		<-sigCh
+		logger.Info("received shutdown signal, unmounting...")
+		if err := unmount(); err != nil {
+			logger.Error("unmount failed", "error", err)
+			os.Exit(1)
+		}
+		logger.Info("unmounted successfully")
+		return
+
 	default:
 		fmt.Printf("Unknown command: %s\n\n", cmd)
 		printUsage()
@@ -188,7 +223,7 @@ func main() {
 func printUsage() {
 	fmt.Println("FStoreX Client")
 	fmt.Println()
-	fmt.Println("Usage: client -mds=<addr> <command> [args]")
+	fmt.Println("Usage: fstorex -mds=<addr> <command> [args]")
 	fmt.Println()
 	fmt.Println("Commands:")
 	fmt.Println("  mkdir <path>                    Create directory")
@@ -200,4 +235,5 @@ func printUsage() {
 	fmt.Println("  replicas <path>                 Show file's replica locations")
 	fmt.Println("  nodes                           List registered data nodes")
 	fmt.Println("  gc                              Trigger orphan data garbage collection")
+	fmt.Println("  mount <mountpoint>              Mount FStoreX as local filesystem (FUSE)")
 }
