@@ -452,6 +452,11 @@ func (c *Client) Open(path string, flags int) (*FileHandle, error) {
 		status = loc.Status
 	}
 
+	// Recovering 状态下禁止写（补副本期间保证新副本数据一致）
+	if status == "recovering" && flags&(O_WRONLY|O_RDWR) != 0 {
+		return nil, fmt.Errorf("open: file is recovering, write not allowed: %s", path)
+	}
+
 	c.logger.Info("file opened", "path", path, "file_id", fileID, "flags", flags, "size", size, "status", status)
 	return &FileHandle{
 		client:   c,

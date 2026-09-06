@@ -162,6 +162,11 @@ type DataService interface {
 
 	// Sync 强制 fsync 确保持久化。
 	Sync(args *SyncArgs, reply *bool) error
+
+	// ReplicateFile 从源 DataNode 拉取文件副本到本地。
+	// 由 MDS 编排，目标 DN 主动 dial 源 DN，分块 RangeRead + PartialWrite。
+	// 数据搬运不经过 MDS，避免成为带宽瓶颈。
+	ReplicateFile(args *ReplicateFileArgs, reply *bool) error
 }
 
 // StoreArgs 存储数据的请求参数。
@@ -199,4 +204,13 @@ type TruncateArgs struct {
 // SyncArgs fsync 的请求参数。
 type SyncArgs struct {
 	Path string `json:"path"`
+}
+
+// ReplicateFileArgs 副本复制请求参数。
+// 目标 DataNode 收到后主动从 SourceAddr 分块拉取数据写入本地 TargetRemotePath。
+type ReplicateFileArgs struct {
+	SourceAddr       string `json:"source_addr"`        // 源 DataNode RPC 地址
+	SourceRemotePath string `json:"source_remote_path"` // 源 DN 上的物理路径 /data/{fileID}
+	TargetRemotePath string `json:"target_remote_path"` // 目标 DN 上的物理路径 /data/{fileID}
+	FileSize         int64  `json:"file_size"`          // 文件总大小，用于分块拉取
 }

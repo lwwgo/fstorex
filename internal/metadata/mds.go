@@ -38,28 +38,33 @@ const (
 	OpDelete         = "delete"
 	OpRename         = "rename"
 	OpUpdateSize     = "update_size"
+	OpUpdateReplicas = "update_replicas" // 补副本完成后原子替换副本列表
+	OpUpdateStatus   = "update_status"   // 补副本期间切换文件状态（complete ↔ recovering）
 )
 
 // 文件状态（仅文件节点有效）
 const (
-	StatusPending  = "pending"  // 元数据已创建，数据尚未完全上传
-	StatusComplete = "complete" // 数据已就绪，可读
+	StatusPending    = "pending"    // 元数据已创建，数据尚未完全上传
+	StatusComplete   = "complete"   // 数据已就绪，可读可写
+	StatusRecovering = "recovering" // 正在补副本，可读但禁止写
 )
 
 // commandPayload is the business command payload carried in a Raft log entry.
 // All fields are JSON-serialized into CommandEntry.Data, ensuring all replicas
 // apply the same commands in the same order for state machine consistency.
 type commandPayload struct {
-	Op         string           `json:"op"`
-	Path       string           `json:"path,omitempty"`
-	Addr       string           `json:"addr,omitempty"` // heartbeat/remove_dn: data node address
-	Size       int64            `json:"size,omitempty"` // create_file: file size
-	Replicas   []types.Replica  `json:"replicas,omitempty"`
-	IsDir      bool             `json:"is_dir,omitempty"`      // delete: whether the target is a directory
-	CreateMode types.CreateMode `json:"create_mode,omitempty"` // create_file: behavior when file exists
-	FileID     string           `json:"file_id,omitempty"`     // create_file: stable object identity (inode equivalent)
-	DstPath    string           `json:"dst_path,omitempty"`    // rename: destination path
-	NewSize    int64            `json:"new_size,omitempty"`    // update_size: new file size
+	Op          string           `json:"op"`
+	Path        string           `json:"path,omitempty"`
+	Addr        string           `json:"addr,omitempty"`         // heartbeat/remove_dn: data node address
+	Size        int64            `json:"size,omitempty"`         // create_file: file size
+	Replicas    []types.Replica  `json:"replicas,omitempty"`     // create_file: initial replicas
+	IsDir       bool             `json:"is_dir,omitempty"`       // delete: whether the target is a directory
+	CreateMode  types.CreateMode `json:"create_mode,omitempty"`  // create_file: behavior when file exists
+	FileID      string           `json:"file_id,omitempty"`      // create_file: stable object identity (inode equivalent)
+	DstPath     string           `json:"dst_path,omitempty"`     // rename: destination path
+	NewSize     int64            `json:"new_size,omitempty"`     // update_size: new file size
+	NewReplicas []types.Replica  `json:"new_replicas,omitempty"` // update_replicas: full new replica list (replace, not append)
+	NewStatus   string           `json:"new_status,omitempty"`   // update_status: target status (complete/recovering)
 }
 
 // entry is a node in the directory tree (file or directory).
@@ -91,6 +96,14 @@ type MetadataServer struct {
 	raftServer    *raft.Server
 	logger        *slog.Logger
 	replicaCount  int // desired number of replicas per file (default 3)
+
+	// 补副本 single-flight：防止同一文件被并发修复
+	repairingMu sync.Mutex
+	repairing   map[string]bool // fileID → true
+
+	// 可配置的时间参数（默认值见 NewMetadataServer，测试时可覆盖）
+	heartbeatTimeout  time.Duration // DN 心跳超时判定
+	replicateInterval time.Duration // 补副本扫描间隔
 }
 
 // NewMetadataServer 创建并启动集成了 Raft 的元数据服务器。
@@ -108,10 +121,13 @@ func NewMetadataServer(raftConfig rafttypes.Config, logger *slog.Logger) (*Metad
 			modTime:   time.Now(),
 			children:  make(map[string]*entry),
 		},
-		dataNodes:     make([]string, 0),
-		lastHeartbeat: make(map[string]time.Time),
-		logger:        logger,
-		replicaCount:  3, // default: 3 replicas per file
+		dataNodes:         make([]string, 0),
+		lastHeartbeat:     make(map[string]time.Time),
+		logger:            logger,
+		replicaCount:      3, // default: 3 replicas per file
+		repairing:         make(map[string]bool),
+		heartbeatTimeout:  10 * time.Minute, // default DN heartbeat timeout
+		replicateInterval: 5 * time.Minute,  // default replication scan interval
 	}
 
 	// 把 mds 作为 StateMachine 注入 Raft
@@ -130,6 +146,9 @@ func NewMetadataServer(raftConfig rafttypes.Config, logger *slog.Logger) (*Metad
 
 	// 启动后台孤儿数据 GC（仅 leader 实际执行）
 	mds.startGC()
+
+	// 启动后台自动补副本（仅 leader 实际执行，周期性扫描）
+	mds.startReplicator()
 
 	logger.Info("metadata server with raft initialized",
 		"local_id", raftConfig.LocalID,
@@ -205,12 +224,17 @@ func (mds *MetadataServer) Heartbeat(addr string, reply *types.HeartbeatReply) e
 	return nil
 }
 
-// Mkdir 创建目录。
+// Mkdir 创建目录。目录也分配稳定 FileID（inode 等价物），
+// 确保 rename 后 inode 号不变（POSIX 语义）。
 func (mds *MetadataServer) Mkdir(path string, reply *bool) error {
 	if err := mds.checkLeader(); err != nil {
 		return err
 	}
-	payload := &commandPayload{Op: OpMkdir, Path: path}
+	fileID, err := generateFileID()
+	if err != nil {
+		return fmt.Errorf("generate file id failed: %w", err)
+	}
+	payload := &commandPayload{Op: OpMkdir, Path: path, FileID: fileID}
 	if err := mds.submitCommand(payload); err != nil {
 		return err
 	}

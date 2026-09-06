@@ -39,6 +39,7 @@ package fuse
 import (
 	"context"
 	"log/slog"
+	"strings"
 	"syscall"
 
 	"github.com/hanwen/go-fuse/v2/fs"
@@ -88,6 +89,7 @@ func (n *fuseNode) Getattr(_ context.Context, _ fs.FileHandle, out *fuse.AttrOut
 }
 
 // Lookup 在目录节点下查找子节点。
+// 用 FileID 生成稳定 inode 号，确保 rename 后 inode 不变（POSIX 语义）。
 func (n *fuseNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
 	childPath := joinPath(n.path, name)
 	info, err := n.client.Stat(childPath)
@@ -101,7 +103,7 @@ func (n *fuseNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) 
 	}
 	inode := n.NewInode(ctx, child, fs.StableAttr{
 		Mode: modeFromInfo(*info),
-		Ino:  inodeFromPath(childPath),
+		Ino:  inodeFromID(info.FileID, childPath),
 	})
 	out.Attr = infoToAttr(info)
 	out.SetEntryTimeout(defaultTimeout)
@@ -120,7 +122,7 @@ func (n *fuseNode) Readdir(_ context.Context) (fs.DirStream, syscall.Errno) {
 		entries = append(entries, fuse.DirEntry{
 			Name: info.Name,
 			Mode: modeFromInfo(info),
-			Ino:  inodeFromPath(joinPath(n.path, info.Name)),
+			Ino:  inodeFromID(info.FileID, joinPath(n.path, info.Name)),
 		})
 	}
 	return fs.NewListDirStream(entries), 0
@@ -160,7 +162,7 @@ func (n *fuseNode) Create(ctx context.Context, name string, _ uint32, flags uint
 	}
 	inode := n.NewInode(ctx, child, fs.StableAttr{
 		Mode: syscall.S_IFREG | 0644,
-		Ino:  inodeFromPath(childPath),
+		Ino:  inodeFromID(fh.FileID(), childPath),
 	})
 	// Create 后文件 size=0，设属性
 	out.Attr = fuse.Attr{
@@ -174,10 +176,14 @@ func (n *fuseNode) Create(ctx context.Context, name string, _ uint32, flags uint
 	return inode, &fuseFileHandle{fh: fh, path: childPath, logger: n.logger}, openFlags, 0
 }
 
-// Mkdir 创建目录。
+// Mkdir 创建目录。创建后 Stat 获取 FileID 生成稳定 inode 号。
 func (n *fuseNode) Mkdir(ctx context.Context, name string, _ uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
 	childPath := joinPath(n.path, name)
 	if err := n.client.Mkdir(childPath); err != nil {
+		return nil, errToErrno(err)
+	}
+	info, err := n.client.Stat(childPath)
+	if err != nil {
 		return nil, errToErrno(err)
 	}
 	child := &fuseNode{
@@ -187,7 +193,7 @@ func (n *fuseNode) Mkdir(ctx context.Context, name string, _ uint32, out *fuse.E
 	}
 	inode := n.NewInode(ctx, child, fs.StableAttr{
 		Mode: syscall.S_IFDIR | 0755,
-		Ino:  inodeFromPath(childPath),
+		Ino:  inodeFromID(info.FileID, childPath),
 	})
 	out.Attr = fuse.Attr{
 		Mode:  syscall.S_IFDIR | 0755,
@@ -224,6 +230,62 @@ func (n *fuseNode) Rename(_ context.Context, name string, newParent fs.InodeEmbe
 	return 0
 }
 
+// Setattr 实现 truncate 等属性修改。go-fuse 中 truncate(path, size)
+// 和 ftruncate(fd, size) 都通过此回调：
+//   - in.Valid & fuse.FATTR_SIZE 表示要修改文件大小（truncate）
+//   - f 非 nil 表示 ftruncate（fd-based），从 fd 层获取底层句柄
+//   - f 为 nil 表示 truncate（path-based），通过 Open 获取临时句柄
+func (n *fuseNode) Setattr(_ context.Context, f fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
+	if in.Valid&fuse.FATTR_SIZE == 0 {
+		// 目前只支持 size 修改，其他属性返回当前值
+		info, err := n.client.Stat(n.path)
+		if err != nil {
+			return errToErrno(err)
+		}
+		out.Attr = infoToAttr(info)
+		out.SetTimeout(defaultTimeout)
+		return 0
+	}
+
+	size := int64(in.Size)
+	if f != nil {
+		// ftruncate(fd, size)：从 fd 层获取底层 FileHandle
+		if h, ok := f.(*fuseFileHandle); ok {
+			if err := h.fh.Truncate(size); err != nil {
+				return errToErrno(err)
+			}
+		} else {
+			return syscall.EIO
+		}
+	} else {
+		// truncate(path, size)：Open 临时句柄
+		fileHandle, err := n.client.Open(n.path, client.O_RDWR)
+		if err != nil {
+			return errToErrno(err)
+		}
+		defer fileHandle.Close()
+		if err := fileHandle.Truncate(size); err != nil {
+			return errToErrno(err)
+		}
+	}
+
+	// 返回更新后的属性
+	info, err := n.client.Stat(n.path)
+	if err != nil {
+		return errToErrno(err)
+	}
+	out.Attr = infoToAttr(info)
+	out.SetTimeout(defaultTimeout)
+	return 0
+}
+
+// Flush 实现 close(2) 时的 flush 回调，轻量 no-op。
+// 真正的持久化和资源释放由 Release 负责（保证只调一次），
+// Flush 可能被调用多次，因此这里不做实际操作，仅返回成功。
+func (n *fuseNode) Flush(_ context.Context, _ fs.FileHandle) syscall.Errno {
+	return 0
+}
+
 // ===== 辅助函数 =====
 
 func infoToAttr(info *types.FileInfo) fuse.Attr {
@@ -255,16 +317,22 @@ func joinPath(parent, name string) string {
 	return parent + "/" + name
 }
 
-// inodeFromPath 用路径生成一个稳定的 inode 号。
-// FUSE 要求 inode 号在文件系统内唯一且稳定，用路径的简单哈希即可。
-func inodeFromPath(path string) uint64 {
+// inodeFromID 用 FileID 生成稳定的 inode 号。
+// POSIX 语义要求 rename 后 inode 号不变，因此基于稳定的 FileID
+// 而非易变的路径生成。FileID 为空时（旧数据兼容）fallback 到路径哈希。
+// root 目录固定为 inode 1。
+func inodeFromID(fileID, path string) uint64 {
+	if path == "/" {
+		return 1 // root 固定 inode
+	}
+	key := fileID
 	var h uint64 = 1469598103934665603 // FNV offset basis
-	for _, c := range path {
+	for _, c := range key {
 		h ^= uint64(c)
 		h *= 1099511628211 // FNV prime
 	}
 	if h == 0 {
-		return 1 // root
+		return 1
 	}
 	return h
 }
@@ -273,33 +341,22 @@ func inodeFromPath(path string) uint64 {
 func errToErrno(err error) syscall.Errno {
 	msg := err.Error()
 	switch {
-	case contains(msg, "not found"), contains(msg, "no such file"):
+	case strings.Contains(msg, "not found"), strings.Contains(msg, "no such file"):
 		return syscall.ENOENT
-	case contains(msg, "already exists"):
+	case strings.Contains(msg, "already exists"):
 		return syscall.EEXIST
-	case contains(msg, "is a directory"), contains(msg, "not a directory"):
+	case strings.Contains(msg, "is a directory"), strings.Contains(msg, "not a directory"):
 		return syscall.ENOTDIR
-	case contains(msg, "permission"):
+	case strings.Contains(msg, "permission"):
 		return syscall.EACCES
 	default:
 		return syscall.EIO
 	}
 }
 
-func contains(s, substr string) bool {
-	if len(substr) == 0 {
-		return true
-	}
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
-}
-
 // 编译期接口断言：确保 fuseNode 实现了 go-fuse 的 inode 层接口
 var _ fs.NodeGetattrer = (*fuseNode)(nil)
+var _ fs.NodeSetattrer = (*fuseNode)(nil)
 var _ fs.NodeLookuper = (*fuseNode)(nil)
 var _ fs.NodeReaddirer = (*fuseNode)(nil)
 var _ fs.NodeOpener = (*fuseNode)(nil)
@@ -307,3 +364,4 @@ var _ fs.NodeCreater = (*fuseNode)(nil)
 var _ fs.NodeMkdirer = (*fuseNode)(nil)
 var _ fs.NodeUnlinker = (*fuseNode)(nil)
 var _ fs.NodeRenamer = (*fuseNode)(nil)
+var _ fs.NodeFlusher = (*fuseNode)(nil)

@@ -39,26 +39,41 @@ func (mds *MetadataServer) applyRemoveDataNode(p *commandPayload) error {
 
 func (mds *MetadataServer) applyMkdir(p *commandPayload) error {
 	parts := splitPath(p.Path)
+	if len(parts) == 0 {
+		return fmt.Errorf("invalid path: %s", p.Path)
+	}
 	current := mds.root
 	now := time.Now()
-	for i, part := range parts {
-		child, exists := current.children[part]
-		if !exists {
-			child = &entry{
-				name:      part,
-				isDir:     true,
-				mode:      0755,
-				createdAt: now,
-				modTime:   now,
-				children:  make(map[string]*entry),
-			}
-			current.children[part] = child
-			current.modTime = now
-		} else if !child.isDir {
-			return fmt.Errorf("%s is not a directory (at level %d: %s)", p.Path, i, part)
+
+	// 遍历中间目录，必须已存在（POSIX mkdir 不隐式创建父目录）
+	for i := 0; i < len(parts)-1; i++ {
+		child, exists := current.children[parts[i]]
+		if !exists || !child.isDir {
+			return fmt.Errorf("parent directory not found: %s (at level %d: %s)", p.Path, i, parts[i])
 		}
 		current = child
 	}
+
+	// 最后一级：创建或校验
+	lastPart := parts[len(parts)-1]
+	if child, exists := current.children[lastPart]; exists {
+		if !child.isDir {
+			return fmt.Errorf("%s is not a directory: %s", p.Path, p.Path)
+		}
+		// 目录已存在，保留原 FileID 不变（幂等）
+		return nil
+	}
+
+	current.children[lastPart] = &entry{
+		name:      lastPart,
+		isDir:     true,
+		mode:      0755,
+		createdAt: now,
+		modTime:   now,
+		fileID:    p.FileID, // 目录也分配稳定 FileID（inode 等价物）
+		children:  make(map[string]*entry),
+	}
+	current.modTime = now
 	return nil
 }
 
@@ -250,7 +265,47 @@ func (mds *MetadataServer) applyUpdateSize(p *commandPayload) error {
 	if e.isDir {
 		return fmt.Errorf("%s is a directory, cannot update size", p.Path)
 	}
+	// Recovering 状态拒绝写（补副本期间禁止写，保证新副本数据一致）
+	if e.status == StatusRecovering {
+		return fmt.Errorf("file is recovering, write not allowed: %s", p.Path)
+	}
 	e.size = p.NewSize
+	e.modTime = time.Now()
+	return nil
+}
+
+// applyUpdateReplicas 原子替换文件的完整副本列表（补副本完成后调用）。
+// 直接替换而非增删，避免多次 Raft op 的竞态。
+func (mds *MetadataServer) applyUpdateReplicas(p *commandPayload) error {
+	e := mds.lookup(p.Path)
+	if e == nil {
+		return fmt.Errorf("path not found: %s", p.Path)
+	}
+	if e.isDir {
+		return fmt.Errorf("%s is a directory, cannot update replicas", p.Path)
+	}
+	if len(p.NewReplicas) == 0 {
+		return fmt.Errorf("new replicas must not be empty: %s", p.Path)
+	}
+	e.replicas = p.NewReplicas
+	e.modTime = time.Now()
+	return nil
+}
+
+// applyUpdateStatus 切换文件状态（complete ↔ recovering）。
+// 用于补副本状态机：complete → recovering（开始补）→ complete（补完）。
+func (mds *MetadataServer) applyUpdateStatus(p *commandPayload) error {
+	e := mds.lookup(p.Path)
+	if e == nil {
+		return fmt.Errorf("path not found: %s", p.Path)
+	}
+	if e.isDir {
+		return fmt.Errorf("%s is a directory, cannot update status", p.Path)
+	}
+	if p.NewStatus != StatusComplete && p.NewStatus != StatusRecovering && p.NewStatus != StatusPending {
+		return fmt.Errorf("invalid target status: %s", p.NewStatus)
+	}
+	e.status = p.NewStatus
 	e.modTime = time.Now()
 	return nil
 }

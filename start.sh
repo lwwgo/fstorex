@@ -32,11 +32,11 @@ if [[ "${1:-}" == "clean" ]]; then
 fi
 
 # 检查是否已构建
-if [[ ! -f "$BIN_DIR/fstorex-metadata" || ! -f "$BIN_DIR/fstorex-datanode" || ! -f "$BIN_DIR/fstorex" ]]; then
+if [[ ! -f "$BIN_DIR/fstorex-mds" || ! -f "$BIN_DIR/fstorex-dn" || ! -f "$BIN_DIR/fstorex" ]]; then
     log "binaries not found, building..."
     mkdir -p "$BIN_DIR"
-    (cd "$SCRIPT_DIR" && go build -o "$BIN_DIR/fstorex-metadata" ./cmd/fstorex-metadata)
-    (cd "$SCRIPT_DIR" && go build -o "$BIN_DIR/fstorex-datanode" ./cmd/fstorex-datanode)
+    (cd "$SCRIPT_DIR" && go build -o "$BIN_DIR/fstorex-mds" ./cmd/fstorex-mds)
+    (cd "$SCRIPT_DIR" && go build -o "$BIN_DIR/fstorex-dn" ./cmd/fstorex-dn)
     (cd "$SCRIPT_DIR" && go build -o "$BIN_DIR/fstorex" ./cmd/fstorex)
 fi
 
@@ -50,17 +50,17 @@ mkdir -p "$DATA_ROOT/dn1" "$DATA_ROOT/dn2"
 
 # 启动 3 个 MDS 节点（Raft 集群）
 log "starting metadata server 1 (localhost:9001)..."
-"$BIN_DIR/fstorex-metadata" -id=localhost:9001 -peers=localhost:9002,localhost:9003 \
+"$BIN_DIR/fstorex-mds" -id=localhost:9001 -peers=localhost:9002,localhost:9003 \
     -waldir="$DATA_ROOT/mds1/wal" -snapdir="$DATA_ROOT/mds1/snap" > "$DATA_ROOT/mds1.log" 2>&1 &
 echo $! >> "$DATA_ROOT/.pids"
 
 log "starting metadata server 2 (localhost:9002)..."
-"$BIN_DIR/fstorex-metadata" -id=localhost:9002 -peers=localhost:9001,localhost:9003 \
+"$BIN_DIR/fstorex-mds" -id=localhost:9002 -peers=localhost:9001,localhost:9003 \
     -waldir="$DATA_ROOT/mds2/wal" -snapdir="$DATA_ROOT/mds2/snap" > "$DATA_ROOT/mds2.log" 2>&1 &
 echo $! >> "$DATA_ROOT/.pids"
 
 log "starting metadata server 3 (localhost:9003)..."
-"$BIN_DIR/fstorex-metadata" -id=localhost:9003 -peers=localhost:9001,localhost:9002 \
+"$BIN_DIR/fstorex-mds" -id=localhost:9003 -peers=localhost:9001,localhost:9002 \
     -waldir="$DATA_ROOT/mds3/wal" -snapdir="$DATA_ROOT/mds3/snap" > "$DATA_ROOT/mds3.log" 2>&1 &
 echo $! >> "$DATA_ROOT/.pids"
 
@@ -70,11 +70,11 @@ sleep 5
 
 # 启动 2 个 DataNode（连任意 MDS 节点，会自动重定向到 leader）
 log "starting data node 1 on :9101..."
-"$BIN_DIR/fstorex-datanode" -addr=:9101 -mds=localhost:9001 -datadir="$DATA_ROOT/dn1" > "$DATA_ROOT/dn1.log" 2>&1 &
+"$BIN_DIR/fstorex-dn" -addr=:9101 -mds=localhost:9001 -datadir="$DATA_ROOT/dn1" > "$DATA_ROOT/dn1.log" 2>&1 &
 echo $! >> "$DATA_ROOT/.pids"
 
 log "starting data node 2 on :9102..."
-"$BIN_DIR/fstorex-datanode" -addr=:9102 -mds=localhost:9001 -datadir="$DATA_ROOT/dn2" > "$DATA_ROOT/dn2.log" 2>&1 &
+"$BIN_DIR/fstorex-dn" -addr=:9102 -mds=localhost:9001 -datadir="$DATA_ROOT/dn2" > "$DATA_ROOT/dn2.log" 2>&1 &
 echo $! >> "$DATA_ROOT/.pids"
 sleep 2
 
@@ -164,4 +164,4 @@ echo ""
 echo -e "${GREEN}========== Demo completed successfully ==========${NC}"
 echo ""
 log "running processes (use './start.sh clean' to stop):"
-ps aux | grep -E 'fstorex-metadata|fstorex-datanode' | grep -v grep | awk '{print "  " $11, $12, $13, $14}'
+ps aux | grep -E 'fstorex-mds|fstorex-dn' | grep -v grep | awk '{print "  " $11, $12, $13, $14}'

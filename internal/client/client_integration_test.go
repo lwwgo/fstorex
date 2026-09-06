@@ -3,12 +3,16 @@
 package client_test
 
 import (
+	"bytes"
+	"fmt"
 	"io"
 	"log/slog"
+	"math/rand"
 	"net"
 	"net/rpc"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -358,4 +362,246 @@ func TestRenameOldFDValid(t *testing.T) {
 	}
 
 	fh.Close()
+}
+
+// 场景 7：并发随机读写一致性
+// 多个 goroutine 对同一文件做分区不重叠的随机写 + 全局随机读，
+// 实时维护本地 reference buffer，最后全量读回与 reference 逐字节比对。
+// 注意：写操作分区不重叠（避免 last-write-wins 导致的 reference 乱序），
+// 读操作可读任意区域。
+func TestConcurrentRandomReadWrite(t *testing.T) {
+	tc := startCluster(t)
+	defer tc.cleanup()
+	c := tc.newClient(t)
+
+	const fileSize = 1 << 20 // 1MB
+	const numGoroutines = 20
+	const opsPerGoroutine = 50
+	const maxBlockSize = 4096
+
+	// 预填充 reference buffer
+	reference := make([]byte, fileSize)
+	for i := range reference {
+		reference[i] = byte(i % 256)
+	}
+
+	// 打开文件写入初始数据
+	fh, err := c.Open("/concurrent.bin", client.O_CREAT|client.O_RDWR)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if _, err := fh.WriteAt(reference, 0); err != nil {
+		t.Fatalf("initial write: %v", err)
+	}
+
+	// 每个 goroutine 负责一个不重叠的写区域
+	regionSize := int64(fileSize / numGoroutines)
+	var refMu sync.Mutex
+	var wg sync.WaitGroup
+	errCh := make(chan error, numGoroutines)
+
+	for g := 0; g < numGoroutines; g++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			rng := rand.New(rand.NewSource(int64(id)*1000 + time.Now().UnixNano()))
+			buf := make([]byte, maxBlockSize)
+			regionStart := int64(id) * regionSize
+			regionEnd := regionStart + regionSize
+			if id == numGoroutines-1 {
+				regionEnd = fileSize // 最后一个 goroutine 负责余数
+			}
+
+			for op := 0; op < opsPerGoroutine; op++ {
+				if rng.Intn(2) == 0 {
+					// Write：只写自己的区域，不重叠
+					offset := regionStart + rng.Int63n(regionEnd-regionStart)
+					maxWrite := int(regionEnd - offset)
+					size := rng.Intn(maxBlockSize) + 1
+					if size > maxWrite {
+						size = maxWrite
+					}
+					data := make([]byte, size)
+					for i := range data {
+						data[i] = byte(rng.Intn(256))
+					}
+					n, err := fh.WriteAt(data, offset)
+					if err != nil {
+						errCh <- fmt.Errorf("goroutine %d write at offset %d: %w", id, offset, err)
+						return
+					}
+					if n != len(data) {
+						errCh <- fmt.Errorf("goroutine %d short write: %d != %d", id, n, len(data))
+						return
+					}
+					refMu.Lock()
+					copy(reference[offset:offset+int64(size)], data)
+					refMu.Unlock()
+				} else {
+					// Read：读任意区域，验证不报错（不做实时比对，
+					// 因为读和并发写之间没有 happens-before 关系）
+					offset := rng.Int63n(fileSize)
+					size := rng.Intn(maxBlockSize) + 1
+					if offset+int64(size) > fileSize {
+						size = int(fileSize - offset)
+					}
+					if size == 0 {
+						continue
+					}
+					n, err := fh.ReadAt(buf[:size], offset)
+					if err != nil && err != io.EOF {
+						errCh <- fmt.Errorf("goroutine %d read at offset %d: %w", id, offset, err)
+						return
+					}
+					if n == 0 && err != io.EOF {
+						errCh <- fmt.Errorf("goroutine %d read 0 bytes without EOF at offset %d", id, offset)
+						return
+					}
+				}
+			}
+		}(g)
+	}
+
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		t.Error(err)
+	}
+
+	if err := fh.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// 全量读回校验
+	fh2, err := c.Open("/concurrent.bin", client.O_RDONLY)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer fh2.Close()
+
+	finalBuf := make([]byte, fileSize)
+	n, err := fh2.ReadAt(finalBuf, 0)
+	if err != nil && err != io.EOF {
+		t.Fatalf("final read: %v", err)
+	}
+	if n != fileSize {
+		t.Fatalf("final read short: %d != %d", n, fileSize)
+	}
+
+	refMu.Lock()
+	match := bytes.Equal(finalBuf, reference)
+	refMu.Unlock()
+	if !match {
+		for i := 0; i < fileSize; i++ {
+			if finalBuf[i] != reference[i] {
+				t.Fatalf("final data mismatch at byte %d: expected %d, got %d", i, reference[i], finalBuf[i])
+			}
+		}
+	}
+}
+
+// 场景 8：并发 sparse write 不破坏零填充区域
+// 多个 goroutine 同时向带 gap 的 offset 写数据，验证 sparse 区域保持为 0。
+func TestConcurrentSparseWrite(t *testing.T) {
+	tc := startCluster(t)
+	defer tc.cleanup()
+	c := tc.newClient(t)
+
+	const totalSize = 4 << 20 // 4MB
+	const numGoroutines = 20
+	const blockSize = 64 * 1024 // 每个 goroutine 写 64KB
+	const gapSize = 64 * 1024   // 每个 block 之间留 64KB sparse gap
+
+	fh, err := c.Open("/sparse_concurrent.bin", client.O_CREAT|client.O_RDWR)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	// 先扩展到 totalSize，确保尾部未写区域存在（为 0）
+	if err := fh.Truncate(totalSize); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+
+	// 每个 goroutine 写一段带 gap 的不重叠区域
+	// block i 写在 offset = i * (blockSize + gapSize)
+	var wg sync.WaitGroup
+	errCh := make(chan error, numGoroutines)
+
+	for g := 0; g < numGoroutines; g++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			offset := int64(id) * (blockSize + gapSize)
+			data := make([]byte, blockSize)
+			// 用 goroutine ID 填充，便于验证
+			for i := range data {
+				data[i] = byte(id)
+			}
+			n, err := fh.WriteAt(data, offset)
+			if err != nil {
+				errCh <- fmt.Errorf("goroutine %d write at %d: %w", id, offset, err)
+				return
+			}
+			if n != len(data) {
+				errCh <- fmt.Errorf("goroutine %d short write: %d != %d", id, n, len(data))
+				return
+			}
+		}(g)
+	}
+
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Error(err)
+	}
+
+	if err := fh.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// 全量读回校验
+	fh2, err := c.Open("/sparse_concurrent.bin", client.O_RDONLY)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer fh2.Close()
+
+	finalBuf := make([]byte, totalSize)
+	n, err := fh2.ReadAt(finalBuf, 0)
+	if err != nil && err != io.EOF {
+		t.Fatalf("read: %v", err)
+	}
+	if n != totalSize {
+		t.Fatalf("read short: %d != %d", n, totalSize)
+	}
+
+	// 校验每个 block 的内容，以及 block 之间的 gap 区域为 0
+	for g := 0; g < numGoroutines; g++ {
+		blockOffset := int64(g) * (blockSize + gapSize)
+		// 校验 block 内容
+		for i := 0; i < blockSize; i++ {
+			if finalBuf[blockOffset+int64(i)] != byte(g) {
+				t.Fatalf("block %d byte %d mismatch: expected %d, got %d", g, i, g, finalBuf[blockOffset+int64(i)])
+			}
+		}
+		// 校验 gap 区域为 0（最后一个 block 后面的 gap 也要校验）
+		gapStart := blockOffset + blockSize
+		gapEnd := gapStart + gapSize
+		if gapEnd > totalSize {
+			gapEnd = totalSize
+		}
+		for i := gapStart; i < gapEnd; i++ {
+			if finalBuf[i] != 0 {
+				t.Fatalf("gap byte %d should be 0, got %d", i, finalBuf[i])
+			}
+		}
+	}
+
+	// 校验尾部未写区域为 0
+	lastBlockEnd := int64(numGoroutines-1)*(blockSize+gapSize) + blockSize
+	for i := lastBlockEnd; i < totalSize; i++ {
+		if finalBuf[i] != 0 {
+			t.Fatalf("tail byte %d should be 0, got %d", i, finalBuf[i])
+		}
+	}
 }

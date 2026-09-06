@@ -38,6 +38,12 @@ type FileHandle struct {
 // 小于此值时退化串行，避免并行 RPC 的调度开销超过收益。
 const minParallelReadSize = 4096
 
+// FileID 返回文件的稳定对象身份（inode 等价物）。
+// rename/unlink 后保持不变，DataNode 物理路径为 /data/{fileID}。
+func (fh *FileHandle) FileID() string {
+	return fh.fileID
+}
+
 // ReadAt 从 offset 随机读取最多 len(buf) 字节。
 //
 // 读取策略（自适应）：
@@ -209,10 +215,8 @@ func (fh *FileHandle) WriteAt(data []byte, offset int64) (int, error) {
 	if needUpdate {
 		fh.size = newEnd
 	}
-	wasPending := fh.status == "pending"
-	if wasPending {
-		fh.status = "complete"
-	}
+	// 注意：不在此处将 status 改为 complete。
+	// complete 由 Close → CompleteFile 统一提交 Raft，避免状态不一致。
 	fh.mu.Unlock()
 
 	if needUpdate {

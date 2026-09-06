@@ -1,17 +1,17 @@
-// fstorex-metadata is the metadata server binary for the distributed file system (Raft cluster edition).
+// fstorex-mds is the metadata server binary for the distributed file system (Raft cluster edition).
 //
-// Each fstorex-metadata node serves two roles simultaneously:
+// Each fstorex-mds node serves two roles simultaneously:
 //  1. Raft cluster member: participates in elections and log replication to guarantee metadata consistency
 //  2. Business RPC service: provides metadata operation interfaces to clients/data nodes
 //
 // Usage (3-node cluster):
 //
 //	# Node 1
-//	./fstorex-metadata -id=localhost:9001 -peers=localhost:9002,localhost:9003 -waldir=/tmp/mds1/wal -snapdir=/tmp/mds1/snap
+//	./fstorex-mds -id=localhost:9001 -peers=localhost:9002,localhost:9003 -waldir=/tmp/mds1/wal -snapdir=/tmp/mds1/snap
 //	# Node 2
-//	./fstorex-metadata -id=localhost:9002 -peers=localhost:9001,localhost:9003 -waldir=/tmp/mds2/wal -snapdir=/tmp/mds2/snap
+//	./fstorex-mds -id=localhost:9002 -peers=localhost:9001,localhost:9003 -waldir=/tmp/mds2/wal -snapdir=/tmp/mds2/snap
 //	# Node 3
-//	./fstorex-metadata -id=localhost:9003 -peers=localhost:9001,localhost:9002 -waldir=/tmp/mds3/wal -snapdir=/tmp/mds3/snap
+//	./fstorex-mds -id=localhost:9003 -peers=localhost:9001,localhost:9002 -waldir=/tmp/mds3/wal -snapdir=/tmp/mds3/snap
 //
 // Clients may connect to any node: write operations are automatically forwarded to the leader, while reads can be served by any node.
 package main
